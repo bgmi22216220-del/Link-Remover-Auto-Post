@@ -23,26 +23,32 @@ ADMIN_ID     = int(os.environ["ADMIN_ID"])
 DATABASE_URL = os.environ["DATABASE_URL"]
 CHANNEL_IDS  = [int(x.strip()) for x in os.environ["CHANNEL_IDS"].split(",")]
 
-# ── DB ────────────────────────────────────────────────────────────────
-async def get_db():
-    return await asyncpg.connect(DATABASE_URL)
+# ── DB POOL + IN-MEMORY CACHE ─────────────────────────────────────────
+_pool: asyncpg.Pool = None
+_footer_cache: str = None   # in-memory footer cache
+
+async def get_pool() -> asyncpg.Pool:
+    global _pool
+    if _pool is None:
+        _pool = await asyncpg.create_pool(DATABASE_URL, min_size=2, max_size=5)
+    return _pool
 
 async def init_db():
-    conn = await get_db()
-    await conn.execute("""
-        CREATE TABLE IF NOT EXISTS footer (
-            id      SERIAL PRIMARY KEY,
-            content TEXT NOT NULL
-        );
-        CREATE TABLE IF NOT EXISTS pending_posts (
-            id       SERIAL PRIMARY KEY,
-            msg_type TEXT NOT NULL,
-            caption  TEXT,
-            file_id  TEXT,
-            raw_text TEXT
-        );
-    """)
-    await conn.close()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("""
+            CREATE TABLE IF NOT EXISTS footer (
+                id      SERIAL PRIMARY KEY,
+                content TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS pending_posts (
+                id       SERIAL PRIMARY KEY,
+                msg_type TEXT NOT NULL,
+                caption  TEXT,
+                file_id  TEXT,
+                raw_text TEXT
+            );
+        """)
     logger.info("DB initialized.")
 
 # ── HELPERS ───────────────────────────────────────────────────────────
@@ -63,29 +69,32 @@ def filter_links(text: str) -> str:
     return result
 
 async def get_footer() -> str:
-    conn = await get_db()
-    row = await conn.fetchrow("SELECT content FROM footer ORDER BY id DESC LIMIT 1")
-    await conn.close()
-    return row["content"] if row else ""
+    global _footer_cache
+    if _footer_cache is not None:
+        return _footer_cache
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT content FROM footer ORDER BY id DESC LIMIT 1")
+    _footer_cache = row["content"] if row else ""
+    return _footer_cache
 
 async def get_pending() -> list:
-    conn = await get_db()
-    rows = await conn.fetch("SELECT * FROM pending_posts ORDER BY id ASC")
-    await conn.close()
-    return rows
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        return await conn.fetch("SELECT * FROM pending_posts ORDER BY id ASC")
 
 async def clear_pending():
-    conn = await get_db()
-    await conn.execute("DELETE FROM pending_posts")
-    await conn.close()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM pending_posts")
 
 async def add_pending(msg_type, caption=None, file_id=None, raw_text=None):
-    conn = await get_db()
-    await conn.execute(
-        "INSERT INTO pending_posts (msg_type, caption, file_id, raw_text) VALUES ($1,$2,$3,$4)",
-        msg_type, caption, file_id, raw_text
-    )
-    await conn.close()
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO pending_posts (msg_type, caption, file_id, raw_text) VALUES ($1,$2,$3,$4)",
+            msg_type, caption, file_id, raw_text
+        )
 
 def is_admin(update: Update) -> bool:
     return update.effective_user.id == ADMIN_ID
@@ -137,10 +146,12 @@ async def cmd_footer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    conn = await get_db()
-    await conn.execute("DELETE FROM footer")
-    await conn.execute("INSERT INTO footer (content) VALUES ($1)", content)
-    await conn.close()
+    global _footer_cache
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        await conn.execute("DELETE FROM footer")
+        await conn.execute("INSERT INTO footer (content) VALUES ($1)", content)
+    _footer_cache = content  # update cache immediately
     await msg.reply_text(
         f"✅ <b>Footer saved!</b>\n\n{content}",
         parse_mode="HTML"
@@ -249,7 +260,9 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.user_data.get("collecting"):
         await clear_pending()
         ctx.user_data["collecting"] = True
+        ctx.user_data["batch_count"] = 0
 
+    # footer from cache — instant, no DB call
     footer = await get_footer()
 
     # ── TEXT ──
@@ -310,7 +323,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⚠️ Unsupported media type.")
         return
 
-    # Silent add — no counter message
+    ctx.user_data["batch_count"] = ctx.user_data.get("batch_count", 0) + 1
 
 # ── SETUP & MAIN ──────────────────────────────────────────────────────
 async def post_init(app: Application):
