@@ -157,6 +157,48 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown"
     )
 
+async def send_one(bot, post, channel_id, footer, retries=3):
+    """Send a single post with FloodWait retry logic."""
+    caption = post["caption"] or ""
+    filtered_caption = filter_links(caption)
+    final_caption = build_preview(filtered_caption, footer)
+    msg_type = post["msg_type"]
+
+    for attempt in range(retries):
+        try:
+            if msg_type == "text":
+                text = filter_links(post["raw_text"] or "")
+                final_text = build_preview(text, footer)
+                await bot.send_message(chat_id=channel_id, text=final_text, parse_mode="HTML")
+            elif msg_type == "photo":
+                await bot.send_photo(chat_id=channel_id, photo=post["file_id"], caption=final_caption, parse_mode="HTML")
+            elif msg_type == "video":
+                await bot.send_video(chat_id=channel_id, video=post["file_id"], caption=final_caption, parse_mode="HTML")
+            elif msg_type == "document":
+                await bot.send_document(chat_id=channel_id, document=post["file_id"], caption=final_caption, parse_mode="HTML")
+            elif msg_type == "audio":
+                await bot.send_audio(chat_id=channel_id, audio=post["file_id"], caption=final_caption, parse_mode="HTML")
+            return True, None
+
+        except Exception as e:
+            err_str = str(e)
+            # FloodWait — wait and retry
+            if "flood" in err_str.lower() or "retry" in err_str.lower():
+                import re as _re
+                wait = 30
+                m = _re.search(r"retry after (\d+)", err_str, _re.IGNORECASE)
+                if m:
+                    wait = int(m.group(1)) + 2
+                logger.warning(f"FloodWait {wait}s for channel {channel_id}, attempt {attempt+1}")
+                await asyncio.sleep(wait)
+                continue
+            # Other error — log and return
+            logger.error(f"Post {post['id']} → {channel_id} FAILED: {err_str}")
+            return False, err_str
+
+    return False, "Max retries exceeded"
+
+
 async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
@@ -168,77 +210,32 @@ async def cmd_send(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     footer = await get_footer()
     total  = len(posts)
     sent   = 0
-    errors = 0
+    failed_logs = []
 
     status_msg = await update.message.reply_text(
-        f"📤 Sending {total} posts to {len(CHANNEL_IDS)} channel(s)...",
+        f"📤 <b>Sending {total} posts...</b>", parse_mode="HTML"
     )
 
     for i, post in enumerate(posts):
         channel_id = CHANNEL_IDS[i % len(CHANNEL_IDS)]
-        caption = post["caption"] or ""
-        filtered_caption = filter_links(caption)
-        final_caption = build_preview(filtered_caption, footer)
-
-        try:
-            msg_type = post["msg_type"]
-
-            if msg_type == "text":
-                text = filter_links(post["raw_text"] or "")
-                final_text = build_preview(text, footer)
-                await ctx.bot.send_message(
-                    chat_id=channel_id,
-                    text=final_text,
-                    parse_mode="HTML"
-                )
-
-            elif msg_type == "photo":
-                await ctx.bot.send_photo(
-                    chat_id=channel_id,
-                    photo=post["file_id"],
-                    caption=final_caption,
-                    parse_mode="HTML"
-                )
-
-            elif msg_type == "video":
-                await ctx.bot.send_video(
-                    chat_id=channel_id,
-                    video=post["file_id"],
-                    caption=final_caption,
-                    parse_mode="HTML"
-                )
-
-            elif msg_type == "document":
-                await ctx.bot.send_document(
-                    chat_id=channel_id,
-                    document=post["file_id"],
-                    caption=final_caption,
-                    parse_mode="HTML"
-                )
-
-            elif msg_type == "audio":
-                await ctx.bot.send_audio(
-                    chat_id=channel_id,
-                    audio=post["file_id"],
-                    caption=final_caption,
-                    parse_mode="HTML"
-                )
-
+        ok, err = await send_one(ctx.bot, post, channel_id, footer)
+        if ok:
             sent += 1
-            await asyncio.sleep(0.5)  # rate limit safety
-
-        except Exception as e:
-            logger.error(f"Error sending post {post['id']} to {channel_id}: {e}")
-            errors += 1
+        else:
+            failed_logs.append(f"Post #{i+1} → {channel_id}: {err}")
+        await asyncio.sleep(0.8)  # safe gap between sends
 
     await clear_pending()
     ctx.user_data["collecting"] = False
 
-    summary = f"✅ *Done!*\n\n📨 Sent: `{sent}/{total}`\n📺 Channels: `{len(CHANNEL_IDS)}`"
-    if errors:
-        summary += f"\n⚠️ Errors: `{errors}`"
+    if sent == total:
+        summary = f"✅ <b>Done! {sent}/{total} posts sent successfully.</b>\n📺 Channels: <code>{len(CHANNEL_IDS)}</code>"
+    else:
+        errors = total - sent
+        summary = f"⚠️ <b>{sent}/{total} sent.</b> {errors} failed.\n\n"
+        summary += "\n".join(failed_logs[:10])  # show first 10 errors
 
-    await status_msg.edit_text(summary, parse_mode="Markdown")
+    await status_msg.edit_text(summary, parse_mode="HTML")
 
 # ── MESSAGE HANDLER ───────────────────────────────────────────────────
 async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -313,12 +310,7 @@ async def handle_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text("⚠️ Unsupported media type.")
         return
 
-    pending = await get_pending()
-    await msg.reply_text(
-        f"✅ Post `#{len(pending)}` added to batch.\n_/send karo jab saare posts ready hon._",
-        parse_mode="Markdown",
-        disable_notification=True
-    )
+    # Silent add — no counter message
 
 # ── SETUP & MAIN ──────────────────────────────────────────────────────
 async def post_init(app: Application):
