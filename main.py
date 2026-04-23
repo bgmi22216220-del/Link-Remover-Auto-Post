@@ -116,25 +116,34 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def cmd_footer(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
-    if not ctx.args:
+
+    msg = update.message
+    # Full text after /footer command (preserves newlines)
+    full_text = msg.text or ""
+    # Strip the /footer command prefix
+    if full_text.lower().startswith("/footer"):
+        content = full_text[len("/footer"):].strip()
+    else:
+        content = ""
+
+    if not content:
         current = await get_footer()
-        msg = f"*Current footer:*\n{current}" if current else "Footer set nahi hai abhi."
-        await update.message.reply_text(
-            f"{msg}\n\n*Usage:* `/footer <text>`\n"
-            f"Example: `/footer 🔥 Join @myChannel`\n\n"
-            f"_Telegram formatting support hai: bold, italic, hyperlinks_",
-            parse_mode="Markdown"
+        display = f"<b>Current footer:</b>\n{current}" if current else "Footer set nahi hai abhi."
+        await msg.reply_text(
+            f"{display}\n\n<b>Usage:</b> <code>/footer your text here</code>\n"
+            f"Newlines, HTML (bold, italic, hyperlinks) sab support hai.\n\n"
+            f"Example:\n<code>/footer 𝙅𝙤𝙞𝙣 𝙈𝙖𝙞𝙣 𝘾𝙝𝙖𝙣𝙣𝙚𝙡\n&lt;a href=\"https://t.me/linkbazr\"&gt;https://t.me/linkbazr&lt;/a&gt;</code>",
+            parse_mode="HTML"
         )
         return
 
-    content = " ".join(ctx.args)
     conn = await get_db()
     await conn.execute("DELETE FROM footer")
     await conn.execute("INSERT INTO footer (content) VALUES ($1)", content)
     await conn.close()
-    await update.message.reply_text(
-        f"✅ *Footer saved!*\n\n{content}",
-        parse_mode="Markdown"
+    await msg.reply_text(
+        f"✅ <b>Footer saved!</b>\n\n{content}",
+        parse_mode="HTML"
     )
 
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
